@@ -4,7 +4,7 @@
 # dsh.client 声明，宿主会按它自动组装浏览器 bundle，这里不用写。
 #
 # 安装（不手改 profile patch）：
-#   dsh plugin --profile desktop add link:<本目录>
+#   dsh plugin --profile <profile> add link:<本目录绝对路径>
 # 手工安装见 INSTALL.md。
 - insert:
     - id: dsh-sidechat

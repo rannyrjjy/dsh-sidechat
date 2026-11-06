@@ -1,6 +1,6 @@
 # dsh-sidechat · 旁侧对话
 
-给 [DSH] 加一个**能对话的全局侧边栏**。模仿 Codex 的 `/side`：在输入框敲 `/side`，右侧就多一个独立的对话面板，跟你主对话互不打扰、同时可见。
+给 **DSH** 加一个**能对话的全局侧边栏**。模仿 Codex 的 `/side`：在输入框敲 `/side`，右侧就多一个独立的对话面板，跟你主对话互不打扰、同时可见。
 
 对话跑在**真实的 DSH 会话**上 —— 不是另接一个 HTTP 客户端，所以侧栏里同样有工具、工作区、权限预设和模型配置，跟主对话一个待遇。
 
@@ -15,16 +15,53 @@
 - **立刻能问** —— 主任务在跑也不影响，旁侧是独立会话，各跑各的；
 - **强绑当前会话** —— 切到别的会话，旁侧对话跟着换成那个会话的；切回来，原来那套又回来了。
 
+## 安装
+
+```bash
+# 1. 拿源码
+git clone https://github.com/rannyrjjy/dsh-sidechat.git
+
+# 2. 装进你的 DSH profile（<profile> 换成你自己的，见下）
+dsh plugin --profile <profile> add link:/absolute/path/to/dsh-sidechat
+
+# 3. 重启 DSH
+```
+
+`<profile>` 是你自己 DSH 的 profile 名。找法：看 `~/.dsh/profiles/` 下面有哪几个目录
+（Windows 是 `%USERPROFILE%\.dsh\profiles\`）。常见的：
+
+- `desktop` —— 桌面端 App（`dsh` 桌面版默认）
+- `web` —— 用 `dsh web` 起的网页版
+
+不确定就两个都看一眼，装上你平时用的那个。
+
+不想 clone 源码的话，从 [Releases](https://github.com/rannyrjjy/dsh-sidechat/releases) 下载
+`dsh-sidechat-<version>.tgz`，然后：
+
+```bash
+dsh plugin --profile <profile> add file:/absolute/path/to/dsh-sidechat-0.1.0.tgz
+```
+
+装完**必须重启 DSH**：浏览器侧 bundle 在宿主启动时组装，页面刷新不够。
+
+卸载：
+
+```bash
+dsh plugin --profile <profile> remove dsh-sidechat
+```
+
+装不上、找不到 `dsh` 命令、想手工装 —— 见 [INSTALL.md](./INSTALL.md)。
+
 ## 强绑定：面板跟着会话走
 
-一句实话：侧栏不是"一个全局聊天框"，而是**每个主会话各有自己的一条旁侧对话**。
+一句实话：侧栏不是「一个全局聊天框」，而是**每个主会话各有自己的一条旁侧对话**。
 
 ```
 主会话 A ──► 旁侧会话 A'   （绑定表：{ A: {sideId: A', seq: 21} } ）
 主会话 B ──► 旁侧会话 B'
 ```
 
-- 切到 B：面板立刻显示 B'（还没聊过就显示"将围绕这个会话新建"），A 的话不会串过来；
+- 切到 B：面板立刻显示 B'（还没聊过就显示「将围绕这个会话新建」），A 的话不会串过来；
 - 切回 A：A' 原样还在，接着问；
 - 在 A 里点「新对话」：只解绑 A，B 的旁侧对话不受影响。
 
@@ -70,33 +107,9 @@
 
 **刻意不显示**：DSH 注入的运行时上下文、技能清单、system-reminder 这类以 user 角色落盘的背景消息。判定标准跟官方 `dsh-session-title` 一致 —— 只认 `message.source.kind === 'user'` 的消息，所以侧栏里看到的就是你自己说的话。
 
-## 安装
-
-```bash
-git clone https://github.com/rannyrjjy/dsh-sidechat.git
-cd dsh-sidechat
-dsh plugin --profile desktop add link:<上面这个克隆目录的绝对路径>
-```
-
-也可以直接从打包好的 tgz 装：
-
-```bash
-dsh plugin --profile desktop add file:<path>/dsh-sidechat-0.1.0.tgz
-```
-
-装完**重启 [DSH]**（浏览器侧 bundle 在宿主启动时组装，热更新覆盖不到新插件）。
-
-卸载：
-
-```bash
-dsh plugin --profile desktop remove dsh-sidechat
-```
-
-细节与手工安装见 [INSTALL.md](./INSTALL.md)。
-
 ## 实现要点
 
-零依赖、零构建 —— 和 `dsh-startup-screen` 同款的**手写 ModuleLoader bundle**，宿主直接吃 `lib/client.js`：
+零依赖、零构建 —— **手写 ModuleLoader bundle**，宿主直接吃 `lib/client.js`：
 
 ```
 lib/index.js     Host 半侧（空实现，只为让 loader 能挂上这条 bundle）
@@ -121,15 +134,27 @@ cordis.patch.yml bundle 补丁层
 - 旁侧会话跟主对话共享同一个工作区和权限预设（它就是普通 DSH 会话）。
 - 上下文是**发送那一刻**的快照。主会话在你提问之后又跑了几步，要等下一问才会带上（这是刻意的：旁侧是问答，不是实时镜像）。
 - 绑定表存在 `localStorage`。换了 profile 或删掉某个会话，那条绑定会失效，面板提示「已不存在」并自动重建，不会卡死。
-- 面板必须有主会话才能提问 —— 它没有"脱离会话的全局聊天"模式，这是强绑定的必然代价。
+- 面板必须有主会话才能提问 —— 它没有「脱离会话的全局聊天」模式，这是强绑定的必然代价。
 
-## 自检
+## 开发
+
+改 `lib/client.js` 后重启宿主即可生效（`link:` 安装的情况下）；改 `package.json` / `cordis.patch.yml` 必须重启。
+
+自检（纯 Node，不需要 DSH 运行时，Node >= 20）：
 
 ```bash
-node test/smoke.mjs
+node test/smoke.mjs   # 50 项断言
+# 或
+npm test
 ```
 
-用极简 React shim + 假 ctx 在 Node 里跑通 50 项断言，覆盖：bundle 加载 → 四类注册 → `/side` 两条分支 → 面板渲染 → **上下文带入且主线零写入** → **增量只发新增内容** → **切换主会话旁侧跟着换** → **切回恢复原会话** → 无主会话时禁用 → 「新对话」只解绑当前 → 陈旧绑定自愈。
+覆盖：bundle 加载 → 四类注册 → `/side` 两条分支 → 面板渲染 → **上下文带入且主线零写入** → **增量只发新增内容** → **切换主会话旁侧跟着换** → **切回恢复原会话** → 无主会话时禁用 → 「新对话」只解绑当前 → 陈旧绑定自愈。
+
+## 兼容性
+
+在 DSH `0.2.1-rc.5` 上开发并验证。用到的是 `ctx.slots` / `ctx.sidebarRightTabs` /
+`ctx.commandUi` / `ctx.uiSession` / `ctx.sessions` 这几个客户端服务，DSH 客户端插件 API
+还在快速演化，跨大版本升级时留意一下。
 
 ## License
 
