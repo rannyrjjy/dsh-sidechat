@@ -1,0 +1,62 @@
+{
+  "name": "dsh-sidechat",
+  "version": "0.1.0",
+  "description": "旁侧对话：给 [DSH] Web 客户端加一个能对话的侧边栏。左侧栏全局入口 + 右侧栏 tab，输入 /side 打开；对话跑在真实 DSH 会话上，带工具、带上下文，可与主对话并存。无需构建（手写 ModuleLoader bundle）。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "sidebar",
+    "chat",
+    "side-chat"
+  ],
+  "type": "module",
+  "icon": "icon.svg",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "icon.svg",
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "INSTALL.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rannyrjjy/dsh-sidechat.git"
+  },
+  "homepage": "https://github.com/rannyrjjy/dsh-sidechat#readme",
+  "bugs": {
+    "url": "https://github.com/rannyrjjy/dsh-sidechat/issues"
+  },
+  "license": "MIT",
+  "author": "rannyrjjy",
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.2.1-rc.5": "compatible"
+      }
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-commands",
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-api-session-controller"
+      ],
+      "platform": "web"
+    }
+  }
+}
