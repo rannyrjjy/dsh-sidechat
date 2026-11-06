@@ -546,6 +546,84 @@ const mapHealed = JSON.parse(window.localStorage.getItem('dsh-sidechat:bindings:
 check('绑定表指向新的旁侧会话', mapHealed['sess-b'].sideId === 'sess-new-3', JSON.stringify(mapHealed))
 check('旧版单会话键已被清掉', window.localStorage.getItem('dsh-sidechat:session:v1') === null, String(window.localStorage.getItem('dsh-sidechat:session:v1')))
 
+/* ── 11. 流式渲染：回答边生成边显示 ────────────────────────────────────── */
+
+// DSH 的回答不是一次落盘的：宿主先连续追加 assistant/live-chunk
+// （reasoning-delta / text-delta），最后才落一条 assistant/message。
+// 只认后者的话，面板会在整个生成期间一直空着 —— 这正是「侧栏好慢」的观感来源。
+
+function pushChunk(session, turn, step, chunk) {
+  const seq = session.eventSource.state.entries.length + 1
+  session.eventSource.push({
+    event: { seq, time: Date.now(), type: 'assistant/live-chunk', data: { turn, step, chunk } }
+  })
+  return seq
+}
+
+const streamMain = makeSession('sess-stream')
+sessions.set('sess-stream', streamMain)
+say(streamMain, 'user', '主会话这边随便在干点活')
+say(streamMain, 'assistant', '活儿干完了。')
+
+setCurrentSession('sess-stream')
+const streamPanel = mount(PanelBody, {})
+await tick()
+findTextarea(streamPanel.tree).props.onChange({ target: { value: '流式测一下' } })
+await findSendButton(streamPanel.tree).props.onClick()
+await tick()
+streamPanel.render()
+
+const sideStream = sessions.get('sess-new-4')
+check('流式测试拿到旁侧会话', !!sideStream, 'created=' + createdCount)
+
+// 只有推理，还没有正文：应该给出会动的进度，而不是一片空白
+pushChunk(sideStream, 1, 1, { type: 'reasoning-delta', index: 0, text: '先想想这个问题该怎么答，'.repeat(3) })
+streamPanel.render()
+check(
+  '推理阶段显示已思考字数而不是空白',
+  streamPanel.text.includes('思考中') && /已思考 \d+ 字/.test(streamPanel.text),
+  streamPanel.text.slice(-200)
+)
+
+// 正文开始流式输出：文本应该逐段长出来
+pushChunk(sideStream, 1, 1, { type: 'block-start', index: 1, blockType: 'text' })
+pushChunk(sideStream, 1, 1, { type: 'text-delta', index: 1, text: '第一段：' })
+streamPanel.render()
+const afterFirstDelta = streamPanel.text
+check('首个 text-delta 立刻出现在转录里', afterFirstDelta.includes('第一段：'), afterFirstDelta.slice(-200))
+
+pushChunk(sideStream, 1, 1, { type: 'text-delta', index: 1, text: '这里是后面的内容。' })
+streamPanel.render()
+check('后续 delta 追加而不是替换', streamPanel.text.includes('第一段：这里是后面的内容。'), streamPanel.text.slice(-200))
+check('流式中的行带光标标记', !!findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('sc-streaming')), streamPanel.text.slice(-200))
+
+// durable 消息到达：顶掉流式行，不能出现两份
+const settleSeq = sideStream.eventSource.state.entries.length + 1
+sideStream.eventSource.push({
+  event: {
+    seq: settleSeq,
+    time: Date.now(),
+    type: 'assistant/message',
+    data: {
+      turn: 1,
+      step: 1,
+      message: { id: 'streamed', role: 'assistant', source: { kind: 'model' }, content: [{ type: 'text', text: '第一段：这里是后面的内容。' }] }
+    }
+  }
+})
+streamPanel.render()
+const occurrences = streamPanel.text.split('第一段：这里是后面的内容。').length - 1
+check('落定后不重复显示（流式行被 durable 顶掉）', occurrences === 1, 'occurrences=' + occurrences + ' text=' + streamPanel.text.slice(-300))
+check('落定后不再有流式光标', !findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('sc-streaming')))
+
+// 工具调用期间要能看到进展
+pushChunk(sideStream, 2, 1, { type: 'block-start', index: 0, blockType: 'tool-call' })
+sideStream.eventSource.push({
+  event: { seq: sideStream.eventSource.state.entries.length + 1, time: Date.now(), type: 'tool/call', data: { name: 'Read' } }
+})
+streamPanel.render()
+check('工具调用给出进展提示', streamPanel.text.includes('Read'), streamPanel.text.slice(-300))
+
 console.log('')
 console.log(failures === 0 ? '全部通过 ✓' : failures + ' 项失败 ✗')
 process.exit(failures === 0 ? 0 : 1)
