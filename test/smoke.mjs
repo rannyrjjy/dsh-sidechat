@@ -573,6 +573,11 @@ if (boundaryType) {
   check('boundary 失败后渲染 fallback', ok.render() === 'FB', String(ok.render()))
 }
 
+// Task 4：原生对话不渲染角色标签（靠布局区分）；助手行 wrapper 类名保持
+check('助手行不再渲染角色标签', !findElement(panel.tree, (el) => String(el.props.className || '').includes('sc-who')), '树中仍有 sc-who')
+check('助手行 wrapper 保留 sc-row sc-assistant', !!findElement(panel.tree, (el) => String(el.props.className || '').includes('sc-row sc-assistant')))
+check('默认不渲染回到底部按钮', !findElement(panel.tree, (el) => el.type === 'button' && textOf(el).join('').indexOf('回到底部') >= 0))
+
 // 主会话又走了两步 → 第二问应该只带增量
 say(mainA, 'user', '顺便看下有没有 3306')
 say(mainA, 'assistant', '没有 3306，只有 22 和 80。')
@@ -778,6 +783,7 @@ panelB.render()
 check('env B 整树无 stub markdown', !findElement(panelB.tree, (el) => String(el.props.className || '').includes('stub-markdown')))
 const plainB = findElement(panelB.tree, (el) => String(el.props.className || '').includes('sc-text') && textOf(el).join('').includes('收到：兜底测一下'))
 check('env B 助手文本仍在 .sc-text 纯文本行', !!plainB, panelB.text.slice(-200))
+check('env B 默认不渲染回到底部按钮', !findElement(panelB.tree, (el) => el.type === 'button' && textOf(el).join('').indexOf('回到底部') >= 0))
 
 // env B 流式/工具回归（Review Focus #4/#5）：推理阶段仍是纯文本进度，工具调用仍是 chip
 const envBS = withWarnCapture(() => makeEnv({})).value
