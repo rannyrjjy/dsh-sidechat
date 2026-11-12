@@ -113,10 +113,17 @@ function evaluate(node, key) {
   const { type, props } = node
   if (typeof type === 'function') {
     const instKey = key + '>' + (type.name || 'anon')
-    // class 组件：new 出实例再求值 render()（React 18 仍支持；错误边界必须用它）
+    // class 组件：new 出实例再求值 render()（React 18 仍支持；错误边界必须用它）。
+    // 展开后的输出打上 __componentClass 标记，测试可回查组件类型。
+    // 注意 createElement 把 children 展平成数组，render() 常返回单元素数组，也要接住。
     if (type.prototype && type.prototype.isReactComponent) {
       const inst = new type(props)
-      return evaluate(inst.render(), instKey)
+      const out = evaluate(inst.render(), instKey)
+      const tagged = Array.isArray(out)
+        ? (out.length === 1 && out[0] && out[0].$$el ? out[0] : null)
+        : out
+      if (tagged && tagged.$$el) tagged.props = { ...tagged.props, __componentClass: type }
+      return out
     }
     let inst = instances.get(instKey)
     if (!inst) { inst = { hooks: [], index: 0 }; instances.set(instKey, inst) }
@@ -201,9 +208,17 @@ function mount(Component, props, rootKey = 'root') {
 
 const SOURCE = fs.readFileSync(path.join(ROOT, 'lib/client.js'), 'utf8')
 
-/** 透明 stub 组件表：不改变元素结构与文案，现有按树/全文匹配的断言仍成立。 */
+/** 透明 stub 组件表：不改变元素结构与文案，现有按树/全文匹配的断言仍成立。
+    MarkdownText 额外带 labels 数据属性 —— shim 会把函数组件展开成输出元素，
+    无法按 type 身份回查 props，只能从输出上读（Ruling：Task 2 Step 1）。 */
 const PRIM_STUBS = {
-  MarkdownText(props) { return ReactShim.createElement('div', { className: 'stub-markdown' }, props.text) },
+  MarkdownText(props) {
+    return ReactShim.createElement('div', {
+      className: 'stub-markdown',
+      'data-labels-copy': props.labels ? props.labels.code.copyLabel : undefined,
+      'data-labels-wrap': props.labels ? props.labels.code.toolbarLabels.wrapLabel : undefined
+    }, props.text)
+  },
   Button({ icon, children, ...rest }) {
     return ReactShim.createElement('button', rest, icon != null ? [icon, children] : children)
   },
@@ -223,6 +238,19 @@ function makeRequire({ primitives } = {}) {
       throw new Error('unexpected require: ' + id)
     }
     throw new Error('unexpected require: ' + id)
+  }
+}
+
+/** 捕获 fn 期间的所有 console.warn（factory 初始化的兜底告警就发生在 makeEnv 内部）。 */
+function withWarnCapture(fn) {
+  const calls = []
+  const original = console.warn
+  console.warn = (...args) => calls.push(args)
+  try {
+    fn(calls)
+    return calls
+  } finally {
+    console.warn = original
   }
 }
 
@@ -523,6 +551,26 @@ check('绑定表记下了 主会话→旁侧会话', JSON.parse(window.localStor
 check('旁侧转录里不显示上下文块', !panel.text.includes('主会话到目前为止的内容'), panel.text.slice(0, 400))
 check('旁侧转录显示了我的问题和回答', panel.text.includes('80 端口是什么服务？') && panel.text.includes('收到：80 端口是什么服务？'), panel.text.slice(0, 400))
 
+/* ── 6b. env A：助手输出走原生 MarkdownText（primitives 整表可用） ──────── */
+
+const mdEl = findElement(panel.tree, (el) => String(el.props.className || '').includes('stub-markdown'))
+check('助手输出走原生 MarkdownText', !!mdEl && textOf(mdEl).join('').includes('收到：'), panel.text.slice(0, 200))
+check('MarkdownText 收到 labels 文案', !!mdEl && mdEl.props['data-labels-copy'] === '复制' && mdEl.props['data-labels-wrap'] === '换行', mdEl && JSON.stringify({ copy: mdEl.props['data-labels-copy'], wrap: mdEl.props['data-labels-wrap'] }))
+
+// 错误边界：shim 会把 class 组件展开成输出，输出上打了 __componentClass 标记，按标记回查
+const boundaryNode = findElement(panel.tree, (el) => {
+  const cls = el.props && el.props.__componentClass
+  return !!cls && typeof cls === 'function' && cls.prototype && cls.prototype.isReactComponent
+})
+check('助手消息包了错误边界', !!boundaryNode, 'tree 中未找到 __componentClass 标记')
+const boundaryType = boundaryNode && boundaryNode.props.__componentClass
+if (boundaryType) {
+  const ok = new boundaryType({ fallback: 'FB', children: 'OK' })
+  check('boundary 正常路径透传 children', ok.render() === 'OK', String(ok.render()))
+  ok.state = { failed: true }
+  check('boundary 失败后渲染 fallback', ok.render() === 'FB', String(ok.render()))
+}
+
 // 主会话又走了两步 → 第二问应该只带增量
 say(mainA, 'user', '顺便看下有没有 3306')
 say(mainA, 'assistant', '没有 3306，只有 22 和 80。')
@@ -685,6 +733,33 @@ sideStream.eventSource.push({
 })
 streamPanel.render()
 check('工具调用给出进展提示', streamPanel.text.includes('Read'), streamPanel.text.slice(-300))
+
+/* ── 12. 兜底：primitives 部分缺失 / 整体缺失 ──────────────────────────── */
+
+// env A2：缺 TextShimmer 的部分表 → factory 只告警一次，warn 点名缺失导出
+const warnA2 = withWarnCapture((calls) => {
+  makeEnv({ primitives: { MarkdownText: PRIM_STUBS.MarkdownText, Button: PRIM_STUBS.Button, DisclosureRow: PRIM_STUBS.DisclosureRow } })
+})
+check('缺单导出只告警一次并点名 TextShimmer', warnA2.length === 1 && warnA2[0].join(' ').includes('TextShimmer'), JSON.stringify(warnA2))
+check('整表全可用时不告警', withWarnCapture((calls) => { makeEnv({ primitives: true }) }).length === 0)
+
+// env B：primitives require 抛错 → 告警一次；助手文本退回 .sc-text 纯文本行，无 stub 元素
+let envFallB
+const warnB = withWarnCapture((calls) => { envFallB = makeEnv({}) })
+check('primitives 整体不可用时告警一次', !!envFallB && warnB.length === 1 && warnB[0].join(' ').includes('primitives 不可用'), JSON.stringify(warnB))
+
+const panelB = mount(envFallB.PanelBody, {})
+say(envFallB.mainA, 'user', '兜底测试问题')
+say(envFallB.mainA, 'assistant', '兜底回答 OK')
+panelB.render()
+const textareaB = findTextarea(panelB.tree)
+textareaB.props.onChange({ target: { value: '兜底测一下' } })
+await findSendButton(panelB.tree).props.onClick()
+await tick()
+panelB.render()
+check('env B 整树无 stub markdown', !findElement(panelB.tree, (el) => String(el.props.className || '').includes('stub-markdown')))
+const plainB = findElement(panelB.tree, (el) => String(el.props.className || '').includes('sc-text') && textOf(el).join('').includes('收到：兜底测一下'))
+check('env B 助手文本仍在 .sc-text 纯文本行', !!plainB, panelB.text.slice(-200))
 
 console.log('')
 console.log(failures === 0 ? '全部通过 ✓' : failures + ' 项失败 ✗')
