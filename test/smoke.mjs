@@ -223,7 +223,10 @@ const PRIM_STUBS = {
     return ReactShim.createElement('button', rest, icon != null ? [icon, children] : children)
   },
   DisclosureRow(props) {
-    return ReactShim.createElement('div', { className: 'stub-disclosure' }, [props.title, props.children, props.collapsedContent])
+    return ReactShim.createElement('div', {
+      className: 'stub-disclosure',
+      'data-expandable': props.expandable === true ? '1' : undefined
+    }, [props.title, props.children, props.collapsedContent])
   },
   TextShimmer(props) { return ReactShim.createElement('span', { className: 'stub-shimmer' }, props.children) }
 }
@@ -241,14 +244,13 @@ function makeRequire({ primitives } = {}) {
   }
 }
 
-/** 捕获 fn 期间的所有 console.warn（factory 初始化的兜底告警就发生在 makeEnv 内部）。 */
+/** 捕获 fn 期间的所有 console.warn；返回 { calls, value }（fn 的返回值一并带回）。 */
 function withWarnCapture(fn) {
   const calls = []
   const original = console.warn
   console.warn = (...args) => calls.push(args)
   try {
-    fn(calls)
-    return calls
+    return { calls, value: fn(calls) }
   } finally {
     console.warn = original
   }
@@ -694,6 +696,11 @@ check(
   streamPanel.text.includes('思考中') && /已思考 \d+ 字/.test(streamPanel.text),
   streamPanel.text.slice(-200)
 )
+// env A：推理阶段应出现原生折叠行（可展开、标题带字数、原文可看）
+const reasoningDisclosure = findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('stub-disclosure') && el.props['data-expandable'] === '1')
+check('推理阶段出现可折叠的思考过程行', !!reasoningDisclosure, streamPanel.text.slice(-200))
+const reasoningBody = findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('sc-reasoning'))
+check('思考行展开可见推理原文', !!reasoningBody && textOf(reasoningBody).join('').includes('先想想这个问题该怎么答'), reasoningBody && textOf(reasoningBody).join('').slice(0, 60))
 
 // 正文开始流式输出：文本应该逐段长出来
 pushChunk(sideStream, 1, 1, { type: 'block-start', index: 1, blockType: 'text' })
@@ -701,6 +708,12 @@ pushChunk(sideStream, 1, 1, { type: 'text-delta', index: 1, text: '第一段：'
 streamPanel.render()
 const afterFirstDelta = streamPanel.text
 check('首个 text-delta 立刻出现在转录里', afterFirstDelta.includes('第一段：'), afterFirstDelta.slice(-200))
+// env A：正文开始后思考行仍在，但标题转为「已思考 N 字」，推理原文不得混进正文
+check('正文流出后思考行仍在且不再显示思考中', !!findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('stub-disclosure') && el.props['data-expandable'] === '1') && streamPanel.text.includes('已思考') && !streamPanel.text.includes('思考中'), streamPanel.text.slice(-200))
+check('推理原文不混进正文标题', (() => {
+  const disc = findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('stub-disclosure') && el.props['data-expandable'] === '1')
+  return !!disc && !textOf(disc).join('').includes('第一段')
+})())
 
 pushChunk(sideStream, 1, 1, { type: 'text-delta', index: 1, text: '这里是后面的内容。' })
 streamPanel.render()
@@ -717,7 +730,7 @@ sideStream.eventSource.push({
     data: {
       turn: 1,
       step: 1,
-      message: { id: 'streamed', role: 'assistant', source: { kind: 'model' }, content: [{ type: 'text', text: '第一段：这里是后面的内容。' }] }
+      message: { id: 'streamed', role: 'assistant', source: { kind: 'model' }, content: [{ type: 'reasoning', text: '想想…' }, { type: 'text', text: '第一段：这里是后面的内容。' }] }
     }
   }
 })
@@ -725,6 +738,8 @@ streamPanel.render()
 const occurrences = streamPanel.text.split('第一段：这里是后面的内容。').length - 1
 check('落定后不重复显示（流式行被 durable 顶掉）', occurrences === 1, 'occurrences=' + occurrences + ' text=' + streamPanel.text.slice(-300))
 check('落定后不再有流式光标', !findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('sc-streaming')))
+const settleReasoning = findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('sc-reasoning'))
+check('落定后推理过程仍可展开', !!settleReasoning && textOf(settleReasoning).join('').includes('想想…'), settleReasoning && textOf(settleReasoning).join(''))
 
 // 工具调用期间要能看到进展
 pushChunk(sideStream, 2, 1, { type: 'block-start', index: 0, blockType: 'tool-call' })
@@ -733,19 +748,22 @@ sideStream.eventSource.push({
 })
 streamPanel.render()
 check('工具调用给出进展提示', streamPanel.text.includes('Read'), streamPanel.text.slice(-300))
+// env A：工具调用是原生非展开行（无 chevron）
+const toolRow = findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('stub-disclosure') && el.props['data-expandable'] === undefined)
+check('工具调用是原生非展开行', !!toolRow && textOf(toolRow).join('').includes('Read'), toolRow && textOf(toolRow).join(''))
 
 /* ── 12. 兜底：primitives 部分缺失 / 整体缺失 ──────────────────────────── */
 
 // env A2：缺 TextShimmer 的部分表 → factory 只告警一次，warn 点名缺失导出
-const warnA2 = withWarnCapture((calls) => {
+const warnA2 = withWarnCapture(() => {
   makeEnv({ primitives: { MarkdownText: PRIM_STUBS.MarkdownText, Button: PRIM_STUBS.Button, DisclosureRow: PRIM_STUBS.DisclosureRow } })
-})
+}).calls
 check('缺单导出只告警一次并点名 TextShimmer', warnA2.length === 1 && warnA2[0].join(' ').includes('TextShimmer'), JSON.stringify(warnA2))
-check('整表全可用时不告警', withWarnCapture((calls) => { makeEnv({ primitives: true }) }).length === 0)
+check('整表全可用时不告警', withWarnCapture(() => { makeEnv({ primitives: true }) }).calls.length === 0)
 
 // env B：primitives require 抛错 → 告警一次；助手文本退回 .sc-text 纯文本行，无 stub 元素
 let envFallB
-const warnB = withWarnCapture((calls) => { envFallB = makeEnv({}) })
+const warnB = withWarnCapture(() => { envFallB = makeEnv({}) }).calls
 check('primitives 整体不可用时告警一次', !!envFallB && warnB.length === 1 && warnB[0].join(' ').includes('primitives 不可用'), JSON.stringify(warnB))
 
 const panelB = mount(envFallB.PanelBody, {})
@@ -760,6 +778,30 @@ panelB.render()
 check('env B 整树无 stub markdown', !findElement(panelB.tree, (el) => String(el.props.className || '').includes('stub-markdown')))
 const plainB = findElement(panelB.tree, (el) => String(el.props.className || '').includes('sc-text') && textOf(el).join('').includes('收到：兜底测一下'))
 check('env B 助手文本仍在 .sc-text 纯文本行', !!plainB, panelB.text.slice(-200))
+
+// env B 流式/工具回归（Review Focus #4/#5）：推理阶段仍是纯文本进度，工具调用仍是 chip
+const envBS = withWarnCapture(() => makeEnv({})).value
+const streamMainB = makeSession('sess-stream-b')
+envBS.sessions.set('sess-stream-b', streamMainB)
+say(streamMainB, 'user', '主会话这边随便在干点活')
+say(streamMainB, 'assistant', '活儿干完了。')
+envBS.setCurrentSession('sess-stream-b')
+const streamPanelB = mount(envBS.PanelBody, {})
+await tick()
+findTextarea(streamPanelB.tree).props.onChange({ target: { value: 'envB 流式测一下' } })
+await findSendButton(streamPanelB.tree).props.onClick()
+await tick()
+streamPanelB.render()
+pushChunk(envBS.sessions.get('sess-new-1'), 1, 1, { type: 'reasoning-delta', index: 0, text: 'envB 先想想。' })
+streamPanelB.render()
+check('env B 推理阶段显示思考中字数', streamPanelB.text.includes('思考中') && /已思考 \d+ 字/.test(streamPanelB.text), streamPanelB.text.slice(-200))
+check('env B 推理阶段无折叠行（回退纯文本）', !findElement(streamPanelB.tree, (el) => String(el.props.className || '').includes('stub-disclosure')))
+envBS.sessions.get('sess-new-1').eventSource.push({
+  event: { seq: envBS.sessions.get('sess-new-1').eventSource.state.entries.length + 1, time: Date.now(), type: 'tool/call', data: { name: 'Bash' } }
+})
+streamPanelB.render()
+const toolChipB = findElement(streamPanelB.tree, (el) => String(el.props.className || '').includes('sc-tool'))
+check('env B 工具调用仍是 .sc-tool chip', !!toolChipB && textOf(toolChipB).join('').includes('Bash'), toolChipB && textOf(toolChipB).join(''))
 
 console.log('')
 console.log(failures === 0 ? '全部通过 ✓' : failures + ' 项失败 ✗')
