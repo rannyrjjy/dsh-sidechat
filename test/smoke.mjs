@@ -809,6 +809,13 @@ streamPanelB.render()
 const toolChipB = findElement(streamPanelB.tree, (el) => String(el.props.className || '').includes('sc-tool'))
 check('env B 工具调用仍是 .sc-tool chip', !!toolChipB && textOf(toolChipB).join('').includes('Bash'), toolChipB && textOf(toolChipB).join(''))
 
+/* ── 13. 兼容声明与版本 ────────────────────────────────────────────────── */
+
+const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
+check('版本升到 0.2.0', pkg.version === '0.2.0', pkg.version)
+check('声明 0.2.2-rc.1 兼容', !!pkg.dsh && !!pkg.dsh.compatibility && !!pkg.dsh.compatibility.dshReleases && pkg.dsh.compatibility.dshReleases['0.2.2-rc.1'] === 'compatible')
+check('保留 0.2.1-rc.5 兼容', !!pkg.dsh.compatibility && !!pkg.dsh.compatibility.dshReleases && pkg.dsh.compatibility.dshReleases['0.2.1-rc.5'] === 'compatible')
+
 console.log('')
 console.log(failures === 0 ? '全部通过 ✓' : failures + ' 项失败 ✗')
 process.exit(failures === 0 ? 0 : 1)

@@ -105,8 +105,9 @@ dsh plugin --profile <profile> remove dsh-sidechat
 
 只渲染 `user/message`、`assistant/message` 和**流式块**，外加工具调用的轻提示。
 
-回答是边生成边显示的：模型一开口就出字，推理阶段显示「思考中… · 已思考 N 字」。
-不是等整段说完才一次性贴出来。
+回答用**原生聊天的同一渲染组件**（`MarkdownText`）显示：markdown、代码块（带复制/换行工具条）、表格、列表，与主对话完全同源，边生成边显示。推理过程折叠成「思考过程」行：平时只看「已思考 N 字」，点开看原文；进行中以微光提示。工具调用是原生样式的轻提示行。
+
+面板按钮与排版走原生 primitives 与主题 token：字号随主题字号设置缩放，深浅色自动跟随。
 
 **刻意不显示**：DSH 注入的运行时上下文、技能清单、system-reminder 这类以 user 角色落盘的背景消息。判定标准跟官方 `dsh-session-title` 一致 —— 只认 `message.source.kind === 'user'` 的消息，所以侧栏里看到的就是你自己说的话。
 
@@ -155,6 +156,7 @@ cordis.patch.yml bundle 补丁层
 - `ctx.commandUi.register()` —— 把 `/side` 变成一个**客户端 action 命令**（只吃裸 token，不落模型消息）；
 - `ctx.uiSession.adapter.current` —— 当前主会话绑定（binding source，有 `getSnapshot`/`subscribe`，正好喂给 `useSyncExternalStore`）。**强绑定的锚点**；
 - `ctx.sessions` —— `create()` 建会话、`retain()` 借引用（顺带拉历史）、`binding.session.prompt()` 发消息、`eventSource` 订阅转录。
+- `require('@deepseek-ai/dsh-client-ui-primitives')` —— 原生 UI 原语（boot 注册表静态模块）：`MarkdownText`（正文渲染）、`Button`（按钮）、`DisclosureRow`（思考过程折叠）、`TextShimmer`（思考中微光）。
 
 会话引用是**计数借用**语义：每次 `retain` 都必须配对 `release`，否则会话作用域一直挂着。所以读主会话上下文那段也是借完立刻还。
 
@@ -174,7 +176,7 @@ DSH 的回答分两步落盘：
 ## 已知边界
 
 - `/side` 只识别**裸命令**。写成 `/side 你好` 会被 DSH 的输入机当作普通文本发给当前会话（官方 `commandUi` action 的固有行为，任何客户端命令都一样）。`/side` 打开面板后输入框会自动聚焦，接着说就行。
-- 侧栏转录是**轻量视图**：工具调用只显示一行名字（不展开参数和结果），不带图片/附件缩略图，不做 markdown 富渲染。
+- 侧栏转录仍是**轻量视图**：markdown/代码块/表格走原生 `MarkdownText` 渲染（依赖 `dsh-client-ui-primitives` 的 `MarkdownText`/`Button`/`DisclosureRow`/`TextShimmer` 四个导出；任一缺失自动回退纯文本，console 有一条 `[dsh-sidechat] primitives 不可用` warn 可查），工具调用只显示一行名字（不展开参数和结果），不带图片/附件缩略图。
 - 旁侧会话跟主对话共享同一个工作区和权限预设（它就是普通 DSH 会话）。
 - 上下文是**发送那一刻**的快照。主会话在你提问之后又跑了几步，要等下一问才会带上（这是刻意的：旁侧是问答，不是实时镜像）。
 - 绑定表存在 `localStorage`。换了 profile 或删掉某个会话，那条绑定会失效，面板提示「已不存在」并自动重建，不会卡死。
@@ -196,9 +198,11 @@ npm test
 
 ## 兼容性
 
-在 DSH `0.2.1-rc.5` 上开发并验证。用到的是 `ctx.slots` / `ctx.sidebarRightTabs` /
-`ctx.commandUi` / `ctx.uiSession` / `ctx.sessions` 这几个客户端服务，DSH 客户端插件 API
-还在快速演化，跨大版本升级时留意一下。
+在 DSH `0.2.1-rc.5` 上开发，`0.2.2-rc.1` 上验证。除了 `ctx.slots` / `ctx.sidebarRightTabs` /
+`ctx.commandUi` / `ctx.uiSession` / `ctx.sessions` 这几个客户端服务，0.2.0 起还依赖 boot 注册表
+静态模块 `@deepseek-ai/dsh-client-ui-primitives` 的 `MarkdownText` / `Button` /
+`DisclosureRow` / `TextShimmer` 四个导出（逐个独立判空，缺失自动回退纯文本渲染并 warn）。
+这些属于应用内 API 而非面向插件的稳定承诺，DSH 客户端插件 API 还在快速演化，跨大版本升级时留意一下。
 
 ## License
 
