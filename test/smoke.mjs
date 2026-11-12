@@ -126,7 +126,7 @@ function evaluate(node, key) {
       return out
     }
     let inst = instances.get(instKey)
-    if (!inst) { inst = { hooks: [], index: 0 }; instances.set(instKey, inst) }
+    if (!inst) { inst = { hooks: [], index: 0, hookCount: -1 }; instances.set(instKey, inst) }
     inst.index = 0
     instanceStack.push(inst)
     let rendered
@@ -135,6 +135,13 @@ function evaluate(node, key) {
     } finally {
       instanceStack.pop()
     }
+    // hook 数不变式（对齐 React 真机行为）：每次渲染 hook 消耗数必须与上次一致。
+    // 普通函数调用子组件（而非 h()）会把子组件的 hooks 记到父组件头上，行数一变
+    // 就崩 —— 真机报 "Rendered more/fewer hooks than during the previous render"。
+    if (inst.hookCount >= 0 && inst.index !== inst.hookCount) {
+      throw new Error('Rendered ' + inst.index + ' hooks vs ' + inst.hookCount + ' in previous render —— hooks 必须无条件同序调用（子组件要走 h()）')
+    }
+    inst.hookCount = inst.index
     return evaluate(rendered, instKey)
   }
   const copy = { $$el: true, type, props: { ...props } }
@@ -571,6 +578,14 @@ if (boundaryType) {
   check('boundary 正常路径透传 children', ok.render() === 'OK', String(ok.render()))
   ok.state = { failed: true }
   check('boundary 失败后渲染 fallback', ok.render() === 'FB', String(ok.render()))
+  // 终审 Important #3：生命周期方法的行为断言（真实错误路径的静态面）
+  const derived = boundaryType.getDerivedStateFromError(new Error('x'))
+  check('boundary 错误置位走 getDerivedStateFromError', !!derived && derived.failed === true, JSON.stringify(derived))
+  const catchCalls = withWarnCapture(() => {
+    const inst = new boundaryType({ fallback: 'FB', children: 'OK' })
+    inst.componentDidCatch(new Error('boom'))
+  })
+  check('boundary componentDidCatch 带前缀告警', catchCalls.calls.length === 1 && catchCalls.calls[0].join(' ').includes('[dsh-sidechat]'), JSON.stringify(catchCalls.calls))
 }
 
 // Task 4：原生对话不渲染角色标签（靠布局区分）；助手行 wrapper 类名保持
@@ -590,6 +605,17 @@ const second = sideA.prompts[1]
 check('第二问带上了主会话的新内容', !!second && second.raw.includes('没有 3306'), second && second.raw.slice(0, 200))
 check('第二问不再重复已经带过的内容', !!second && !second.raw.includes('扫完了，开了 22 和 80。'), second && second.raw.slice(0, 300))
 check('第二问没有新建会话', createdCountRef.count === 1, 'created=' + createdCountRef.count)
+
+// hook 序列回归（终审 Critical #1）：durable 带推理块 → 折叠行首次出现。
+// 子组件必须走 h()；直调会把它的 useState 记进 Transcript 的 hook 序列，
+// 这里 hook 数 0→1，shim 的不变式会直接爆红。
+const seqR = sideA.eventSource.state.entries.length + 1
+sideA.eventSource.push({
+  event: { seq: seqR, type: 'assistant/message', data: { message: { id: 'r1', role: 'assistant', source: { kind: 'model' }, content: [{ type: 'reasoning', text: '想想这个。' }, { type: 'text', text: '结论：没问题。' }] } } }
+})
+panel.render()
+const revealReasoning = findElement(panel.tree, (el) => String(el.props.className || '').includes('sc-reasoning'))
+check('带推理的 durable 回答出现折叠行', !!revealReasoning && textOf(revealReasoning).join('').includes('想想这个。'), panel.text.slice(-200))
 
 /* ── 7. 切换主会话：旁侧对话跟着换 ─────────────────────────────────────── */
 
@@ -757,14 +783,39 @@ check('工具调用给出进展提示', streamPanel.text.includes('Read'), strea
 const toolRow = findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('stub-disclosure') && el.props['data-expandable'] === undefined)
 check('工具调用是原生非展开行', !!toolRow && textOf(toolRow).join('').includes('Read'), toolRow && textOf(toolRow).join(''))
 
+// hook 序列回归（终审 Critical #1）：带推理的流式行出现（折叠 +1）再被无推理
+// durable 顶掉（-1）——两次 hook 数变化都必须稳定，直调子组件必爆不变式。
+pushChunk(sideStream, 3, 1, { type: 'reasoning-delta', index: 0, text: '第三轮想一想。' })
+pushChunk(sideStream, 3, 1, { type: 'text-delta', index: 1, text: '第三轮回答。' })
+streamPanel.render()
+const seqT3 = sideStream.eventSource.state.entries.length + 1
+sideStream.eventSource.push({
+  event: { seq: seqT3, time: Date.now(), type: 'assistant/message', data: { turn: 3, step: 1, message: { id: 't3', role: 'assistant', source: { kind: 'model' }, content: [{ type: 'text', text: '第三轮回答。' }] } } }
+})
+streamPanel.render()
+check('第三轮落定后推理折叠随流式行退休', !findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('sc-reasoning') && textOf(el).join('').includes('第三轮想一想')), streamPanel.text.slice(-200))
+
 /* ── 12. 兜底：primitives 部分缺失 / 整体缺失 ──────────────────────────── */
 
-// env A2：缺 TextShimmer 的部分表 → factory 只告警一次，warn 点名缺失导出
+// env A2：缺 TextShimmer 的部分表 → factory 只告警一次，warn 点名缺失导出；
+// 且其余部位照常（Review Focus #1）：markdown 仍走 stub、shimmer 组件不渲染、进度文本可见
+let envA2
 const warnA2 = withWarnCapture(() => {
-  makeEnv({ primitives: { MarkdownText: PRIM_STUBS.MarkdownText, Button: PRIM_STUBS.Button, DisclosureRow: PRIM_STUBS.DisclosureRow } })
+  envA2 = makeEnv({ primitives: { MarkdownText: PRIM_STUBS.MarkdownText, Button: PRIM_STUBS.Button, DisclosureRow: PRIM_STUBS.DisclosureRow } })
 }).calls
 check('缺单导出只告警一次并点名 TextShimmer', warnA2.length === 1 && warnA2[0].join(' ').includes('TextShimmer'), JSON.stringify(warnA2))
 check('整表全可用时不告警', withWarnCapture(() => { makeEnv({ primitives: true }) }).calls.length === 0)
+const panelA2 = mount(envA2.PanelBody, {})
+const textareaA2 = findTextarea(panelA2.tree)
+textareaA2.props.onChange({ target: { value: 'A2 测一下' } })
+await findSendButton(panelA2.tree).props.onClick()
+await tick()
+panelA2.render()
+pushChunk(envA2.sessions.get('sess-new-1'), 1, 1, { type: 'reasoning-delta', index: 0, text: 'A2 想一想。' })
+panelA2.render()
+check('缺 shimmer 时 markdown 照常渲染', !!findElement(panelA2.tree, (el) => String(el.props.className || '').includes('stub-markdown')))
+check('缺 shimmer 时不渲染 shimmer 组件', !findElement(panelA2.tree, (el) => String(el.props.className || '').includes('stub-shimmer')))
+check('缺 shimmer 时思考进度仍可见', panelA2.text.includes('思考中') && /已思考 \d+ 字/.test(panelA2.text), panelA2.text.slice(-200))
 
 // env B：primitives require 抛错 → 告警一次；助手文本退回 .sc-text 纯文本行，无 stub 元素
 let envFallB
