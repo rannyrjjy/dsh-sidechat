@@ -1,6 +1,6 @@
 {
   "name": "dsh-sidechat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "旁侧对话：给 [DSH] Web 客户端加一个能对话的侧边栏。左侧栏全局入口 + 右侧栏 tab，输入 /side 打开；对话跑在真实 DSH 会话上，带工具、带上下文，可与主对话并存。无需构建（手写 ModuleLoader bundle）。",
   "keywords": [
     "dsh",
@@ -47,7 +47,8 @@
     },
     "compatibility": {
       "dshReleases": {
-        "0.2.1-rc.5": "compatible"
+        "0.2.1-rc.5": "compatible",
+        "0.2.2-rc.1": "compatible"
       }
     },
     "client": {
@@ -59,6 +60,7 @@
         "@deepseek-ai/dsh-client-ui-layout",
         "@deepseek-ai/dsh-api-session-controller"
       ],
+      "external": ["@deepseek-ai/dsh-client-ui-primitives"],
       "platform": "web"
     }
   }

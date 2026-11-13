@@ -43,6 +43,16 @@ function useSlot(init) {
   }]
 }
 
+/** class 组件基类：错误边界等 class 组件用（本套件里只有 render + 手动 state）。 */
+class ComponentShim {
+  constructor(props) { this.props = props; this.state = null }
+  setState(patch) {
+    this.state = typeof patch === 'function' ? patch(this.state) : { ...this.state, ...patch }
+    queueRerender()
+  }
+}
+ComponentShim.prototype.isReactComponent = {}
+
 const ReactShim = {
   createElement(type, props, ...children) {
     const flat = []
@@ -88,7 +98,8 @@ const ReactShim = {
       inst.hooks[index] = { unsubscribe: subscribe(() => queueRerender()) }
     }
     return getSnapshot()
-  }
+  },
+  Component: ComponentShim
 }
 
 /** 展开组件函数，得到一棵只剩宿主元素的树。 */
@@ -102,8 +113,20 @@ function evaluate(node, key) {
   const { type, props } = node
   if (typeof type === 'function') {
     const instKey = key + '>' + (type.name || 'anon')
+    // class 组件：new 出实例再求值 render()（React 18 仍支持；错误边界必须用它）。
+    // 展开后的输出打上 __componentClass 标记，测试可回查组件类型。
+    // 注意 createElement 把 children 展平成数组，render() 常返回单元素数组，也要接住。
+    if (type.prototype && type.prototype.isReactComponent) {
+      const inst = new type(props)
+      const out = evaluate(inst.render(), instKey)
+      const tagged = Array.isArray(out)
+        ? (out.length === 1 && out[0] && out[0].$$el ? out[0] : null)
+        : out
+      if (tagged && tagged.$$el) tagged.props = { ...tagged.props, __componentClass: type }
+      return out
+    }
     let inst = instances.get(instKey)
-    if (!inst) { inst = { hooks: [], index: 0 }; instances.set(instKey, inst) }
+    if (!inst) { inst = { hooks: [], index: 0, hookCount: -1 }; instances.set(instKey, inst) }
     inst.index = 0
     instanceStack.push(inst)
     let rendered
@@ -112,6 +135,13 @@ function evaluate(node, key) {
     } finally {
       instanceStack.pop()
     }
+    // hook 数不变式（对齐 React 真机行为）：每次渲染 hook 消耗数必须与上次一致。
+    // 普通函数调用子组件（而非 h()）会把子组件的 hooks 记到父组件头上，行数一变
+    // 就崩 —— 真机报 "Rendered more/fewer hooks than during the previous render"。
+    if (inst.hookCount >= 0 && inst.index !== inst.hookCount) {
+      throw new Error('Rendered ' + inst.index + ' hooks vs ' + inst.hookCount + ' in previous render —— hooks 必须无条件同序调用（子组件要走 h()）')
+    }
+    inst.hookCount = inst.index
     return evaluate(rendered, instKey)
   }
   const copy = { $$el: true, type, props: { ...props } }
@@ -179,36 +209,59 @@ function mount(Component, props, rootKey = 'root') {
   return runtime
 }
 
-/* ── 2. 假运行环境 ──────────────────────────────────────────────────────── */
+/* ── 2. bundle 源码与双环境工厂 ─────────────────────────────────────────── */
+/* 每套环境重新 new Function 加载：factory 闭包捕获当次传入的 window/document。
+   primitives: true → 整表透明 stub；对象 → 部分表（缺单导出变体用）；false/缺省 → require 抛错（兜底路径）。 */
 
-const styleEls = new Map()
-globalThis.window = {
-  localStorage: {
-    store: new Map(),
-    getItem(k) { return this.store.has(k) ? this.store.get(k) : null },
-    setItem(k, v) { this.store.set(k, String(v)) },
-    removeItem(k) { this.store.delete(k) }
+const SOURCE = fs.readFileSync(path.join(ROOT, 'lib/client.js'), 'utf8')
+
+/** 透明 stub 组件表：不改变元素结构与文案，现有按树/全文匹配的断言仍成立。
+    MarkdownText 额外带 labels 数据属性 —— shim 会把函数组件展开成输出元素，
+    无法按 type 身份回查 props，只能从输出上读（Ruling：Task 2 Step 1）。 */
+const PRIM_STUBS = {
+  MarkdownText(props) {
+    return ReactShim.createElement('div', {
+      className: 'stub-markdown',
+      'data-labels-copy': props.labels ? props.labels.code.copyLabel : undefined,
+      'data-labels-wrap': props.labels ? props.labels.code.toolbarLabels.wrapLabel : undefined
+    }, props.text)
   },
-  __ModuleLoader__: { load(spec) { window.__loaded = spec } }
-}
-globalThis.document = {
-  head: { appendChild(el) { styleEls.set(el.id, el) } },
-  getElementById(id) { return styleEls.get(id) || null },
-  createElement() { return { id: '', textContent: '' } }
+  Button({ icon, children, ...rest }) {
+    return ReactShim.createElement('button', rest, icon != null ? [icon, children] : children)
+  },
+  DisclosureRow(props) {
+    return ReactShim.createElement('div', {
+      className: 'stub-disclosure',
+      'data-expandable': props.expandable === true ? '1' : undefined
+    }, [props.title, props.children, props.collapsedContent])
+  },
+  TextShimmer(props) { return ReactShim.createElement('span', { className: 'stub-shimmer' }, props.children) }
 }
 
-/* ── 3. 加载 bundle ─────────────────────────────────────────────────────── */
-
-const source = fs.readFileSync(path.join(ROOT, 'lib/client.js'), 'utf8')
-new Function('window', 'document', 'require', 'console', source)(
-  globalThis.window,
-  globalThis.document,
-  (id) => {
+/** factory 用的 require。 */
+function makeRequire({ primitives } = {}) {
+  return (id) => {
     if (id === 'react') return ReactShim
+    if (id === '@deepseek-ai/dsh-client-ui-primitives') {
+      if (primitives === true) return { ...PRIM_STUBS }
+      if (primitives && typeof primitives === 'object') return { ...primitives }
+      throw new Error('unexpected require: ' + id)
+    }
     throw new Error('unexpected require: ' + id)
-  },
-  console
-)
+  }
+}
+
+/** 捕获 fn 期间的所有 console.warn；返回 { calls, value }（fn 的返回值一并带回）。 */
+function withWarnCapture(fn) {
+  const calls = []
+  const original = console.warn
+  console.warn = (...args) => calls.push(args)
+  try {
+    return { calls, value: fn(calls) }
+  } finally {
+    console.warn = original
+  }
+}
 
 let failures = 0
 const check = (name, ok, detail) => {
@@ -216,31 +269,133 @@ const check = (name, ok, detail) => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok || detail === undefined ? '' : ' — ' + detail}`)
 }
 
-check('bundle 注册到 ModuleLoader', !!window.__loaded && window.__loaded.id === 'dsh-sidechat')
-
-const mod = window.__loaded.factory((id) => {
-  if (id === 'react') return ReactShim
-  throw new Error('unexpected require: ' + id)
-})
-
-check('导出 apply', typeof mod.apply === 'function')
-check('导出 inject 服务名', Array.isArray(mod.inject) && mod.inject.includes('sidebarRight'), JSON.stringify(mod.inject))
-
-/* ── 4. 假 ctx，跑 apply ────────────────────────────────────────────────── */
-
-
-const registrations = { tabs: [], slots: [], commands: [], openTabs: [], panels: [] }
-let createdCount = 0
-const sessions = new Map()
-const goneSessions = new Set()
-
-/** 当前主会话（uiSession.adapter.current 的快照）。 */
-let sessionSnapshot = { key: 'sess-a' }
-const sessionListeners = new Set()
-function setCurrentSession(key) {
-  sessionSnapshot = { key }
-  sessionListeners.forEach((fn) => fn())
+// shim 支持 class 组件（ReactShim.Component + evaluate 分支）
+class Probe extends ReactShim.Component {
+  render() { return ReactShim.createElement('div', null, 'probe-ok') }
 }
+const probeTree = evaluate(ReactShim.createElement(Probe, null), 'probe')
+check('shim 支持 class 组件', textOf(probeTree).join('') === 'probe-ok', textOf(probeTree).join(''))
+
+/**
+ * 一套独立假环境。makeSession/say 是模块级纯函数（见下），会话池、注册表与
+ * localStorage 都在环境内部；bundle 在环境内重新加载并 factory + apply。
+ */
+function makeEnv({ primitives } = {}) {
+  const styleEls = new Map()
+  const envWindow = {
+    localStorage: {
+      store: new Map(),
+      getItem(k) { return this.store.has(k) ? this.store.get(k) : null },
+      setItem(k, v) { this.store.set(k, String(v)) },
+      removeItem(k) { this.store.delete(k) }
+    },
+    __ModuleLoader__: { load(spec) { envWindow.__loaded = spec } }
+  }
+  const envDocument = {
+    head: { appendChild(el) { styleEls.set(el.id, el) } },
+    getElementById(id) { return styleEls.get(id) || null },
+    createElement() { return { id: '', textContent: '' } }
+  }
+  new Function('window', 'document', 'require', 'console', SOURCE)(
+    envWindow, envDocument, makeRequire({ primitives }), console
+  )
+  const mod = envWindow.__loaded.factory(makeRequire({ primitives }))
+
+  const registrations = { tabs: [], slots: [], commands: [], openTabs: [], panels: [] }
+  const createdCountRef = { count: 0 }
+  const sessions = new Map()
+  const goneSessions = new Set()
+  let sessionSnapshot = { key: 'sess-a' }
+  const sessionListeners = new Set()
+  function setCurrentSession(key) {
+    sessionSnapshot = { key }
+    sessionListeners.forEach((fn) => fn())
+  }
+
+  const mainA = makeSession('sess-a')
+  const mainB = makeSession('sess-b')
+  sessions.set('sess-a', mainA)
+  sessions.set('sess-b', mainB)
+
+  const ctx = {
+    effect(fn) { return fn() },
+    slots: {
+      inject(_name, fn) { fn() },
+      register(spec, Component) { registrations.slots.push({ spec, Component }); return () => {} }
+    },
+    sidebarRightTabs: { register(def) { registrations.tabs.push(def); return () => {} } },
+    sidebarRight: { openTab(kind) { registrations.openTabs.push(kind) } },
+    commandUi: { register(contribution) { registrations.commands.push(contribution); return () => {} } },
+    // 当前会话绑定：adapter.current 是 binding source（getSnapshot/subscribe）
+    uiSession: {
+      adapter: {
+        current: {
+          getSnapshot: () => sessionSnapshot,
+          subscribe(fn) { sessionListeners.add(fn); return () => sessionListeners.delete(fn) }
+        }
+      }
+    },
+    sessions: {
+      // 真实契约：create() 直接返回会话 id 字符串（失败抛错）
+      async create() {
+        createdCountRef.count += 1
+        const id = 'sess-new-' + createdCountRef.count
+        sessions.set(id, makeSession(id))
+        return id
+      },
+      // 真实契约：retain(id, { source }) → { sessionId, ready: Promise<binding>, release() }
+      retain(id, options) {
+        if (goneSessions.has(id)) {
+          const error = new Error(`sessions.retain: unknown session ${id}`)
+          return {
+            sessionId: id,
+            source: options && options.source,
+            ready: Promise.reject(error),
+            release() {}
+          }
+        }
+        if (!sessions.has(id)) sessions.set(id, makeSession(id))
+        const session = sessions.get(id)
+        return {
+          sessionId: id,
+          source: options && options.source,
+          ready: session.open().then(() => ({ session })),
+          release() {}
+        }
+      }
+    },
+    layout: { selectPanel(id) { registrations.panels.push(id) } }
+  }
+  mod.apply(ctx)
+
+  const bodySlot = registrations.slots.find((s) => s.spec.name === 'sidebar.right.pane.tab')
+
+  /** console.warn 间谍（兜底告警断言用）。 */
+  const warnCalls = []
+  const originalWarn = console.warn
+  function spyWarn() { console.warn = (...args) => warnCalls.push(args) }
+  function unspyWarn() { console.warn = originalWarn }
+
+  return {
+    window: envWindow, document: envDocument, styleEls, mod, registrations,
+    sessions, goneSessions, createdCountRef, setCurrentSession, ctx,
+    mainA, mainB, bodySlot, PanelBody: bodySlot.Component,
+    warnCalls, spyWarn, unspyWarn
+  }
+}
+
+const envA = makeEnv({ primitives: true })
+const { window, ctx, registrations, sessions, goneSessions, createdCountRef, setCurrentSession, PanelBody, mainA, mainB, styleEls } = envA
+
+check('bundle 注册到 ModuleLoader', !!window.__loaded && window.__loaded.id === 'dsh-sidechat')
+check('导出 apply', typeof envA.mod.apply === 'function')
+check('导出 inject 服务名', Array.isArray(envA.mod.inject) && envA.mod.inject.includes('sidebarRight'), JSON.stringify(envA.mod.inject))
+
+/* ── 4. 假 ctx 已在 makeEnv 内跑过 apply；以下断言跑在 env A 上 ─────────── */
+
+// env B（primitives require 抛错）健全性：apply 一样能注册
+const envB = makeEnv({})
+check('env B 可用（同样注册了右侧栏 tab）', envB.registrations.tabs.length === 1 && envB.registrations.tabs[0].kind === 'side-chat', JSON.stringify(envB.registrations.tabs))
 
 function makeSession(sessionId) {
   return {
@@ -318,62 +473,7 @@ function say(session, who, text) {
   })
 }
 
-const mainA = makeSession('sess-a')
-const mainB = makeSession('sess-b')
-sessions.set('sess-a', mainA)
-sessions.set('sess-b', mainB)
-
-const ctx = {
-  effect(fn) { return fn() },
-  slots: {
-    inject(_name, fn) { fn() },
-    register(spec, Component) { registrations.slots.push({ spec, Component }); return () => {} }
-  },
-  sidebarRightTabs: { register(def) { registrations.tabs.push(def); return () => {} } },
-  sidebarRight: { openTab(kind) { registrations.openTabs.push(kind) } },
-  commandUi: { register(contribution) { registrations.commands.push(contribution); return () => {} } },
-  // 当前会话绑定：adapter.current 是 binding source（getSnapshot/subscribe）
-  uiSession: {
-    adapter: {
-      current: {
-        getSnapshot: () => sessionSnapshot,
-        subscribe(fn) { sessionListeners.add(fn); return () => sessionListeners.delete(fn) }
-      }
-    }
-  },
-  sessions: {
-    // 真实契约：create() 直接返回会话 id 字符串（失败抛错）
-    async create() {
-      createdCount += 1
-      const id = 'sess-new-' + createdCount
-      sessions.set(id, makeSession(id))
-      return id
-    },
-    // 真实契约：retain(id, { source }) → { sessionId, ready: Promise<binding>, release() }
-    retain(id, options) {
-      if (goneSessions.has(id)) {
-        const error = new Error(`sessions.retain: unknown session ${id}`)
-        return {
-          sessionId: id,
-          source: options && options.source,
-          ready: Promise.reject(error),
-          release() {}
-        }
-      }
-      if (!sessions.has(id)) sessions.set(id, makeSession(id))
-      const session = sessions.get(id)
-      return {
-        sessionId: id,
-        source: options && options.source,
-        ready: session.open().then(() => ({ session })),
-        release() {}
-      }
-    }
-  },
-  layout: { selectPanel(id) { registrations.panels.push(id) } }
-}
-
-mod.apply(ctx)
+/* mainA/mainB/ctx/mod.apply 已移入 makeEnv（见上） */
 
 const tabDef = registrations.tabs[0]
 check('注册右侧栏 tab 类型', !!tabDef && tabDef.kind === 'side-chat' && tabDef.id === 'dsh-sidechat/chat', JSON.stringify(tabDef))
@@ -404,7 +504,6 @@ setCurrentSession('sess-a')
 
 /* ── 5. 渲染面板 ────────────────────────────────────────────────────────── */
 
-const PanelBody = bodySlot.Component
 const panel = mount(PanelBody, {})
 check('面板渲染出标题', panel.text.includes('旁侧对话'), panel.text.slice(0, 120))
 check('空状态提示绑定到当前会话', panel.text.includes('将围绕这个会话新建'), panel.text.slice(0, 200))
@@ -452,7 +551,7 @@ await tick()
 panel.render()
 
 const sideA = sessions.get('sess-new-1')
-check('首次发送自动新建旁侧会话', createdCount === 1, 'created=' + createdCount)
+check('首次发送自动新建旁侧会话', createdCountRef.count === 1, 'created=' + createdCountRef.count)
 check('问题本身发到了旁侧会话', !!sideA && sideA.prompts.length === 1 && sideA.prompts[0].question === '80 端口是什么服务？', JSON.stringify(sideA && sideA.prompts.map((p) => p.question)))
 check('旁侧会话收到了主会话上下文', !!sideA && sideA.prompts[0].raw.includes('扫完了，开了 22 和 80。'), sideA && sideA.prompts[0].raw.slice(0, 200))
 check('主会话没有被写入任何消息', mainA.prompts.length === 0, 'prompts=' + mainA.prompts.length)
@@ -460,6 +559,39 @@ check('发送模式是 queue', !!sideA && sideA.prompts[0].mode === 'queue')
 check('绑定表记下了 主会话→旁侧会话', JSON.parse(window.localStorage.getItem('dsh-sidechat:bindings:v2'))['sess-a'].sideId === 'sess-new-1', window.localStorage.getItem('dsh-sidechat:bindings:v2'))
 check('旁侧转录里不显示上下文块', !panel.text.includes('主会话到目前为止的内容'), panel.text.slice(0, 400))
 check('旁侧转录显示了我的问题和回答', panel.text.includes('80 端口是什么服务？') && panel.text.includes('收到：80 端口是什么服务？'), panel.text.slice(0, 400))
+
+/* ── 6b. env A：助手输出走原生 MarkdownText（primitives 整表可用） ──────── */
+
+const mdEl = findElement(panel.tree, (el) => String(el.props.className || '').includes('stub-markdown'))
+check('助手输出走原生 MarkdownText', !!mdEl && textOf(mdEl).join('').includes('收到：'), panel.text.slice(0, 200))
+check('MarkdownText 收到 labels 文案', !!mdEl && mdEl.props['data-labels-copy'] === '复制' && mdEl.props['data-labels-wrap'] === '换行', mdEl && JSON.stringify({ copy: mdEl.props['data-labels-copy'], wrap: mdEl.props['data-labels-wrap'] }))
+
+// 错误边界：shim 会把 class 组件展开成输出，输出上打了 __componentClass 标记，按标记回查
+const boundaryNode = findElement(panel.tree, (el) => {
+  const cls = el.props && el.props.__componentClass
+  return !!cls && typeof cls === 'function' && cls.prototype && cls.prototype.isReactComponent
+})
+check('助手消息包了错误边界', !!boundaryNode, 'tree 中未找到 __componentClass 标记')
+const boundaryType = boundaryNode && boundaryNode.props.__componentClass
+if (boundaryType) {
+  const ok = new boundaryType({ fallback: 'FB', children: 'OK' })
+  check('boundary 正常路径透传 children', ok.render() === 'OK', String(ok.render()))
+  ok.state = { failed: true }
+  check('boundary 失败后渲染 fallback', ok.render() === 'FB', String(ok.render()))
+  // 终审 Important #3：生命周期方法的行为断言（真实错误路径的静态面）
+  const derived = boundaryType.getDerivedStateFromError(new Error('x'))
+  check('boundary 错误置位走 getDerivedStateFromError', !!derived && derived.failed === true, JSON.stringify(derived))
+  const catchCalls = withWarnCapture(() => {
+    const inst = new boundaryType({ fallback: 'FB', children: 'OK' })
+    inst.componentDidCatch(new Error('boom'))
+  })
+  check('boundary componentDidCatch 带前缀告警', catchCalls.calls.length === 1 && catchCalls.calls[0].join(' ').includes('[dsh-sidechat]'), JSON.stringify(catchCalls.calls))
+}
+
+// Task 4：原生对话不渲染角色标签（靠布局区分）；助手行 wrapper 类名保持
+check('助手行不再渲染角色标签', !findElement(panel.tree, (el) => String(el.props.className || '').includes('sc-who')), '树中仍有 sc-who')
+check('助手行 wrapper 保留 sc-row sc-assistant', !!findElement(panel.tree, (el) => String(el.props.className || '').includes('sc-row sc-assistant')))
+check('默认不渲染回到底部按钮', !findElement(panel.tree, (el) => el.type === 'button' && textOf(el).join('').indexOf('回到底部') >= 0))
 
 // 主会话又走了两步 → 第二问应该只带增量
 say(mainA, 'user', '顺便看下有没有 3306')
@@ -472,7 +604,18 @@ panel.render()
 const second = sideA.prompts[1]
 check('第二问带上了主会话的新内容', !!second && second.raw.includes('没有 3306'), second && second.raw.slice(0, 200))
 check('第二问不再重复已经带过的内容', !!second && !second.raw.includes('扫完了，开了 22 和 80。'), second && second.raw.slice(0, 300))
-check('第二问没有新建会话', createdCount === 1, 'created=' + createdCount)
+check('第二问没有新建会话', createdCountRef.count === 1, 'created=' + createdCountRef.count)
+
+// hook 序列回归（终审 Critical #1）：durable 带推理块 → 折叠行首次出现。
+// 子组件必须走 h()；直调会把它的 useState 记进 Transcript 的 hook 序列，
+// 这里 hook 数 0→1，shim 的不变式会直接爆红。
+const seqR = sideA.eventSource.state.entries.length + 1
+sideA.eventSource.push({
+  event: { seq: seqR, type: 'assistant/message', data: { message: { id: 'r1', role: 'assistant', source: { kind: 'model' }, content: [{ type: 'reasoning', text: '想想这个。' }, { type: 'text', text: '结论：没问题。' }] } } }
+})
+panel.render()
+const revealReasoning = findElement(panel.tree, (el) => String(el.props.className || '').includes('sc-reasoning'))
+check('带推理的 durable 回答出现折叠行', !!revealReasoning && textOf(revealReasoning).join('').includes('想想这个。'), panel.text.slice(-200))
 
 /* ── 7. 切换主会话：旁侧对话跟着换 ─────────────────────────────────────── */
 
@@ -491,7 +634,7 @@ await tick()
 panel.render()
 
 const sideB = sessions.get('sess-new-2')
-check('B 会话拿到独立的旁侧会话', createdCount === 2 && !!sideB, 'created=' + createdCount)
+check('B 会话拿到独立的旁侧会话', createdCountRef.count === 2 && !!sideB, 'created=' + createdCountRef.count)
 check('B 的旁侧会话只带 B 的上下文', !!sideB && sideB.prompts[0].raw.includes('报告模板已经就位') && !sideB.prompts[0].raw.includes('扫完了，开了 22 和 80。'), sideB && sideB.prompts[0].raw.slice(0, 300))
 check('绑定表里 A 与 B 各一条', (() => {
   const map = JSON.parse(window.localStorage.getItem('dsh-sidechat:bindings:v2'))
@@ -503,7 +646,7 @@ setCurrentSession('sess-a')
 await tick()
 panel.render()
 check('切回 A 恢复 A 的旁侧对话', panel.text.includes('80 端口是什么服务？') && panel.text.includes('那 SSH 版本是多少？'), panel.text.slice(0, 500))
-check('切回 A 不新建会话', createdCount === 2, 'created=' + createdCount)
+check('切回 A 不新建会话', createdCountRef.count === 2, 'created=' + createdCountRef.count)
 
 /* ── 8. 没有主会话时不能用 ─────────────────────────────────────────────── */
 
@@ -540,7 +683,7 @@ findTextarea(healed.tree).props.onChange({ target: { value: '这个会话还能�
 await findSendButton(healed.tree).props.onClick()
 await tick()
 healed.render()
-check('陈旧绑定之后能自动新建接着问', createdCount === 3, 'created=' + createdCount)
+check('陈旧绑定之后能自动新建接着问', createdCountRef.count === 3, 'created=' + createdCountRef.count)
 check('新旁侧会话收到上下文', !!sessions.get('sess-new-3') && sessions.get('sess-new-3').prompts[0].raw.includes('报告模板已经就位'), JSON.stringify(sessions.get('sess-new-3') && sessions.get('sess-new-3').prompts[0].raw.slice(0, 200)))
 const mapHealed = JSON.parse(window.localStorage.getItem('dsh-sidechat:bindings:v2'))
 check('绑定表指向新的旁侧会话', mapHealed['sess-b'].sideId === 'sess-new-3', JSON.stringify(mapHealed))
@@ -574,7 +717,7 @@ await tick()
 streamPanel.render()
 
 const sideStream = sessions.get('sess-new-4')
-check('流式测试拿到旁侧会话', !!sideStream, 'created=' + createdCount)
+check('流式测试拿到旁侧会话', !!sideStream, 'created=' + createdCountRef.count)
 
 // 只有推理，还没有正文：应该给出会动的进度，而不是一片空白
 pushChunk(sideStream, 1, 1, { type: 'reasoning-delta', index: 0, text: '先想想这个问题该怎么答，'.repeat(3) })
@@ -584,6 +727,11 @@ check(
   streamPanel.text.includes('思考中') && /已思考 \d+ 字/.test(streamPanel.text),
   streamPanel.text.slice(-200)
 )
+// env A：推理阶段应出现原生折叠行（可展开、标题带字数、原文可看）
+const reasoningDisclosure = findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('stub-disclosure') && el.props['data-expandable'] === '1')
+check('推理阶段出现可折叠的思考过程行', !!reasoningDisclosure, streamPanel.text.slice(-200))
+const reasoningBody = findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('sc-reasoning'))
+check('思考行展开可见推理原文', !!reasoningBody && textOf(reasoningBody).join('').includes('先想想这个问题该怎么答'), reasoningBody && textOf(reasoningBody).join('').slice(0, 60))
 
 // 正文开始流式输出：文本应该逐段长出来
 pushChunk(sideStream, 1, 1, { type: 'block-start', index: 1, blockType: 'text' })
@@ -591,6 +739,12 @@ pushChunk(sideStream, 1, 1, { type: 'text-delta', index: 1, text: '第一段：'
 streamPanel.render()
 const afterFirstDelta = streamPanel.text
 check('首个 text-delta 立刻出现在转录里', afterFirstDelta.includes('第一段：'), afterFirstDelta.slice(-200))
+// env A：正文开始后思考行仍在，但标题转为「已思考 N 字」，推理原文不得混进正文
+check('正文流出后思考行仍在且不再显示思考中', !!findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('stub-disclosure') && el.props['data-expandable'] === '1') && streamPanel.text.includes('已思考') && !streamPanel.text.includes('思考中'), streamPanel.text.slice(-200))
+check('推理原文不混进正文标题', (() => {
+  const disc = findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('stub-disclosure') && el.props['data-expandable'] === '1')
+  return !!disc && !textOf(disc).join('').includes('第一段')
+})())
 
 pushChunk(sideStream, 1, 1, { type: 'text-delta', index: 1, text: '这里是后面的内容。' })
 streamPanel.render()
@@ -607,7 +761,7 @@ sideStream.eventSource.push({
     data: {
       turn: 1,
       step: 1,
-      message: { id: 'streamed', role: 'assistant', source: { kind: 'model' }, content: [{ type: 'text', text: '第一段：这里是后面的内容。' }] }
+      message: { id: 'streamed', role: 'assistant', source: { kind: 'model' }, content: [{ type: 'reasoning', text: '想想…' }, { type: 'text', text: '第一段：这里是后面的内容。' }] }
     }
   }
 })
@@ -615,6 +769,8 @@ streamPanel.render()
 const occurrences = streamPanel.text.split('第一段：这里是后面的内容。').length - 1
 check('落定后不重复显示（流式行被 durable 顶掉）', occurrences === 1, 'occurrences=' + occurrences + ' text=' + streamPanel.text.slice(-300))
 check('落定后不再有流式光标', !findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('sc-streaming')))
+const settleReasoning = findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('sc-reasoning'))
+check('落定后推理过程仍可展开', !!settleReasoning && textOf(settleReasoning).join('').includes('想想…'), settleReasoning && textOf(settleReasoning).join(''))
 
 // 工具调用期间要能看到进展
 pushChunk(sideStream, 2, 1, { type: 'block-start', index: 0, blockType: 'tool-call' })
@@ -623,6 +779,93 @@ sideStream.eventSource.push({
 })
 streamPanel.render()
 check('工具调用给出进展提示', streamPanel.text.includes('Read'), streamPanel.text.slice(-300))
+// env A：工具调用是原生非展开行（无 chevron）
+const toolRow = findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('stub-disclosure') && el.props['data-expandable'] === undefined)
+check('工具调用是原生非展开行', !!toolRow && textOf(toolRow).join('').includes('Read'), toolRow && textOf(toolRow).join(''))
+
+// hook 序列回归（终审 Critical #1）：带推理的流式行出现（折叠 +1）再被无推理
+// durable 顶掉（-1）——两次 hook 数变化都必须稳定，直调子组件必爆不变式。
+pushChunk(sideStream, 3, 1, { type: 'reasoning-delta', index: 0, text: '第三轮想一想。' })
+pushChunk(sideStream, 3, 1, { type: 'text-delta', index: 1, text: '第三轮回答。' })
+streamPanel.render()
+const seqT3 = sideStream.eventSource.state.entries.length + 1
+sideStream.eventSource.push({
+  event: { seq: seqT3, time: Date.now(), type: 'assistant/message', data: { turn: 3, step: 1, message: { id: 't3', role: 'assistant', source: { kind: 'model' }, content: [{ type: 'text', text: '第三轮回答。' }] } } }
+})
+streamPanel.render()
+check('第三轮落定后推理折叠随流式行退休', !findElement(streamPanel.tree, (el) => String(el.props.className || '').includes('sc-reasoning') && textOf(el).join('').includes('第三轮想一想')), streamPanel.text.slice(-200))
+
+/* ── 12. 兜底：primitives 部分缺失 / 整体缺失 ──────────────────────────── */
+
+// env A2：缺 TextShimmer 的部分表 → factory 只告警一次，warn 点名缺失导出；
+// 且其余部位照常（Review Focus #1）：markdown 仍走 stub、shimmer 组件不渲染、进度文本可见
+let envA2
+const warnA2 = withWarnCapture(() => {
+  envA2 = makeEnv({ primitives: { MarkdownText: PRIM_STUBS.MarkdownText, Button: PRIM_STUBS.Button, DisclosureRow: PRIM_STUBS.DisclosureRow } })
+}).calls
+check('缺单导出只告警一次并点名 TextShimmer', warnA2.length === 1 && warnA2[0].join(' ').includes('TextShimmer'), JSON.stringify(warnA2))
+check('整表全可用时不告警', withWarnCapture(() => { makeEnv({ primitives: true }) }).calls.length === 0)
+const panelA2 = mount(envA2.PanelBody, {})
+const textareaA2 = findTextarea(panelA2.tree)
+textareaA2.props.onChange({ target: { value: 'A2 测一下' } })
+await findSendButton(panelA2.tree).props.onClick()
+await tick()
+panelA2.render()
+pushChunk(envA2.sessions.get('sess-new-1'), 1, 1, { type: 'reasoning-delta', index: 0, text: 'A2 想一想。' })
+panelA2.render()
+check('缺 shimmer 时 markdown 照常渲染', !!findElement(panelA2.tree, (el) => String(el.props.className || '').includes('stub-markdown')))
+check('缺 shimmer 时不渲染 shimmer 组件', !findElement(panelA2.tree, (el) => String(el.props.className || '').includes('stub-shimmer')))
+check('缺 shimmer 时思考进度仍可见', panelA2.text.includes('思考中') && /已思考 \d+ 字/.test(panelA2.text), panelA2.text.slice(-200))
+
+// env B：primitives require 抛错 → 告警一次；助手文本退回 .sc-text 纯文本行，无 stub 元素
+let envFallB
+const warnB = withWarnCapture(() => { envFallB = makeEnv({}) }).calls
+check('primitives 整体不可用时告警一次', !!envFallB && warnB.length === 1 && warnB[0].join(' ').includes('primitives 不可用'), JSON.stringify(warnB))
+
+const panelB = mount(envFallB.PanelBody, {})
+say(envFallB.mainA, 'user', '兜底测试问题')
+say(envFallB.mainA, 'assistant', '兜底回答 OK')
+panelB.render()
+const textareaB = findTextarea(panelB.tree)
+textareaB.props.onChange({ target: { value: '兜底测一下' } })
+await findSendButton(panelB.tree).props.onClick()
+await tick()
+panelB.render()
+check('env B 整树无 stub markdown', !findElement(panelB.tree, (el) => String(el.props.className || '').includes('stub-markdown')))
+const plainB = findElement(panelB.tree, (el) => String(el.props.className || '').includes('sc-text') && textOf(el).join('').includes('收到：兜底测一下'))
+check('env B 助手文本仍在 .sc-text 纯文本行', !!plainB, panelB.text.slice(-200))
+check('env B 默认不渲染回到底部按钮', !findElement(panelB.tree, (el) => el.type === 'button' && textOf(el).join('').indexOf('回到底部') >= 0))
+
+// env B 流式/工具回归（Review Focus #4/#5）：推理阶段仍是纯文本进度，工具调用仍是 chip
+const envBS = withWarnCapture(() => makeEnv({})).value
+const streamMainB = makeSession('sess-stream-b')
+envBS.sessions.set('sess-stream-b', streamMainB)
+say(streamMainB, 'user', '主会话这边随便在干点活')
+say(streamMainB, 'assistant', '活儿干完了。')
+envBS.setCurrentSession('sess-stream-b')
+const streamPanelB = mount(envBS.PanelBody, {})
+await tick()
+findTextarea(streamPanelB.tree).props.onChange({ target: { value: 'envB 流式测一下' } })
+await findSendButton(streamPanelB.tree).props.onClick()
+await tick()
+streamPanelB.render()
+pushChunk(envBS.sessions.get('sess-new-1'), 1, 1, { type: 'reasoning-delta', index: 0, text: 'envB 先想想。' })
+streamPanelB.render()
+check('env B 推理阶段显示思考中字数', streamPanelB.text.includes('思考中') && /已思考 \d+ 字/.test(streamPanelB.text), streamPanelB.text.slice(-200))
+check('env B 推理阶段无折叠行（回退纯文本）', !findElement(streamPanelB.tree, (el) => String(el.props.className || '').includes('stub-disclosure')))
+envBS.sessions.get('sess-new-1').eventSource.push({
+  event: { seq: envBS.sessions.get('sess-new-1').eventSource.state.entries.length + 1, time: Date.now(), type: 'tool/call', data: { name: 'Bash' } }
+})
+streamPanelB.render()
+const toolChipB = findElement(streamPanelB.tree, (el) => String(el.props.className || '').includes('sc-tool'))
+check('env B 工具调用仍是 .sc-tool chip', !!toolChipB && textOf(toolChipB).join('').includes('Bash'), toolChipB && textOf(toolChipB).join(''))
+
+/* ── 13. 兼容声明与版本 ────────────────────────────────────────────────── */
+
+const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
+check('版本升到 0.2.0', pkg.version === '0.2.0', pkg.version)
+check('声明 0.2.2-rc.1 兼容', !!pkg.dsh && !!pkg.dsh.compatibility && !!pkg.dsh.compatibility.dshReleases && pkg.dsh.compatibility.dshReleases['0.2.2-rc.1'] === 'compatible')
+check('保留 0.2.1-rc.5 兼容', !!pkg.dsh.compatibility && !!pkg.dsh.compatibility.dshReleases && pkg.dsh.compatibility.dshReleases['0.2.1-rc.5'] === 'compatible')
 
 console.log('')
 console.log(failures === 0 ? '全部通过 ✓' : failures + ' 项失败 ✗')
